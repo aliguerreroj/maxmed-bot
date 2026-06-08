@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model BasePrice {
+  id          Int       @id @default(autoincrement())
+
+  category    String    // test_strips | libre | dexcom_g6 | dexcom_g7
+  productName String    // verbatim from the sheet
+  reference   String?   // TEXT, preserves leading zeros: "012", "OE", "OR & OM"
+  condition   String    // mint | damaged | short_date | expired
+
+  dateFrom    DateTime? @db.Date
+  dateTo      DateTime? @db.Date
+
+  price       Decimal   @db.Decimal(10, 2)
+
+  dingRule    AdjustmentRule? @relation(fields: [dingRuleKey], references: [scopeKey])
+  dingRuleKey String?
+
+  sourceSheet String
+  sourceRow   Int
+
+  @@index([category, productName, reference, condition])
+}
+
+model AdjustmentRule {
+  id          Int      @id @default(autoincrement())
+  scopeKey    String   @unique
+  deltaAmount Decimal  @db.Decimal(10, 2)
+  note        String?
+  sourceSheet String
+
+  basePrices  BasePrice[]
+}
