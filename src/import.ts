@@ -9,6 +9,7 @@
 import ExcelJS from "exceljs";
 import { prisma } from "./lib/db.js";
 import { parseTestStrips } from "./parsers/testStrips.js";
+import { parseLibre } from "./parsers/libre.js";
 import { KNOWN_CONDITIONS, type ParseResult } from "./parsers/types.js";
 
 const SHEET_PATH = process.argv[2] ?? "data/price-sheet.xlsx";
@@ -33,7 +34,17 @@ async function main(): Promise<void> {
   allRules.push(...tsResult.rules);
   allWarnings.push(...tsResult.warnings.map((w) => `[Test Strips] ${w}`));
 
-  // TODO Phase 2 cont: wire parseLibre(ws) and parseDexcom(ws) here.
+  // Libres
+  const libWs = wb.getWorksheet("Libres");
+  if (!libWs) {
+    throw new Error('Sheet "Libres" not found in workbook');
+  }
+  const libResult = parseLibre(libWs);
+  allPrices.push(...libResult.prices);
+  allRules.push(...libResult.rules);
+  allWarnings.push(...libResult.warnings.map((w) => `[Libres] ${w}`));
+
+  // TODO Phase 2 cont: wire parseDexcom(ws) here.
 
   // ---- runtime validation: fail-loud on unknown conditions ----
   const knownSet = new Set<string>(KNOWN_CONDITIONS);
