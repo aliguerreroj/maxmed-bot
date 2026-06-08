@@ -10,6 +10,7 @@ import ExcelJS from "exceljs";
 import { prisma } from "./lib/db.js";
 import { parseTestStrips } from "./parsers/testStrips.js";
 import { parseLibre } from "./parsers/libre.js";
+import { parseDexcom } from "./parsers/dexcom.js";
 import { KNOWN_CONDITIONS, type ParseResult } from "./parsers/types.js";
 
 const SHEET_PATH = process.argv[2] ?? "data/price-sheet.xlsx";
@@ -44,7 +45,15 @@ async function main(): Promise<void> {
   allRules.push(...libResult.rules);
   allWarnings.push(...libResult.warnings.map((w) => `[Libres] ${w}`));
 
-  // TODO Phase 2 cont: wire parseDexcom(ws) here.
+  // Dexcom G6/G7
+  const dexWs = wb.getWorksheet("G6G7");
+  if (!dexWs) {
+    throw new Error('Sheet "G6G7" not found in workbook');
+  }
+  const dexResult = parseDexcom(dexWs);
+  allPrices.push(...dexResult.prices);
+  allRules.push(...dexResult.rules);
+  allWarnings.push(...dexResult.warnings.map((w) => `[G6G7] ${w}`));
 
   // ---- runtime validation: fail-loud on unknown conditions ----
   const knownSet = new Set<string>(KNOWN_CONDITIONS);
