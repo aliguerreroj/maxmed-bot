@@ -18,6 +18,10 @@ export interface ExtractionItem {
   condition: RequestCondition | null;
   expirationDate: string | null; // "YYYY-MM-DD"
   quantity: number | null;
+  /** What the seller called the product, verbatim. Set even when the product
+   *  doesn't match any catalog entry. Null only when no product was mentioned
+   *  at all (pure follow-up with just date/qty). */
+  rawProductDescription: string | null;
 }
 
 export interface ExtractionResult {
@@ -35,19 +39,20 @@ const EXTRACTION_TOOL: Anthropic.Tool = {
       items: {
         type: "array",
         description:
-          "Extracted supply items. Empty array if the message is a greeting or non-supply query.",
+          "Extracted supply items. Empty array ONLY if the message is a pure greeting with no supply information at all. " +
+          "If the seller mentions ANY product or supply — even one not in the catalog — return an item.",
         items: {
           type: "object",
           properties: {
             category: {
               type: "string",
               description:
-                'One of: "test_strips", "libre", "dexcom_g6", "dexcom_g7". Use null if uncertain.',
+                'One of: "test_strips", "libre", "dexcom_g6", "dexcom_g7". Use null if uncertain or product is not in catalog.',
             },
             productName: {
               type: "string",
               description:
-                "Exact product name from the catalog. Must match EXACTLY. Use null if uncertain.",
+                "Exact product name from the catalog. Must match EXACTLY. Use null if the product is not in the catalog or uncertain.",
             },
             reference: {
               type: "string",
@@ -74,6 +79,14 @@ const EXTRACTION_TOOL: Anthropic.Tool = {
               description:
                 "Number of boxes/packs the seller has. null if not mentioned.",
             },
+            rawProductDescription: {
+              type: "string",
+              description:
+                "The seller's original description of the product, verbatim or close to it " +
+                '(e.g. "Omnipod Dash pods", "Medtronic pump supplies"). ' +
+                "ALWAYS set this when the seller mentions a product, even if it doesn't match any catalog entry. " +
+                "null ONLY when no product was mentioned at all (e.g. a pure follow-up like 'expires May 2027').",
+            },
           },
           required: [
             "category",
@@ -82,6 +95,7 @@ const EXTRACTION_TOOL: Anthropic.Tool = {
             "condition",
             "expirationDate",
             "quantity",
+            "rawProductDescription",
           ],
         },
       },
@@ -107,7 +121,9 @@ RULES:
 4. Parse expiration dates into YYYY-MM-DD format. Use the 1st of the month if only month/year is given.
 5. Set any field to null if you are not confident about the value.
 6. NEVER ask about or reference the seller's health in any way.
-7. If the message is a greeting or general question (not describing supplies), set isGreeting to true and return an empty items array.
+7. If the message is ONLY a greeting or general question with NO supply-related details at all, set isGreeting to true and return an empty items array.
+8. IMPORTANT — partial follow-ups: if the message contains supply-related details (expiration date, quantity, condition) but does NOT name a specific product, you MUST still return an item with category and productName set to null but the other fields filled in. Set rawProductDescription to null in this case. The system uses conversation history to fill in the product. Never return an empty items array when the message has extractable supply information.
+9. IMPORTANT — unrecognized products: if the seller names a product that is NOT in the catalog (e.g. "Omnipod Dash", "Medtronic pump supplies"), you MUST still return an item with category and productName set to null, but set rawProductDescription to the seller's original product description. Never return an empty items array when the seller mentions a product — even one not in the catalog.
 
 PRODUCT CATALOG (use these exact names):
 
