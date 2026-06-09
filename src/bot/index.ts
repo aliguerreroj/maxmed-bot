@@ -5,7 +5,7 @@
  * then listens for messages and runs the pipeline per-message.
  */
 
-import { Bot } from "grammy";
+import { Bot, InputFile } from "grammy";
 import Anthropic from "@anthropic-ai/sdk";
 import { env } from "../lib/env.js";
 import { prisma } from "../lib/db.js";
@@ -50,12 +50,19 @@ async function main(): Promise<void> {
 
       await ctx.reply(response.text);
 
-      // If the item needs human review, forward to admin (placeholder)
+      // Send PDF quote if items were quoted
+      if (response.pdfBuffer) {
+        await ctx.replyWithDocument(
+          new InputFile(response.pdfBuffer, "MAXMED-Quote.pdf"),
+          { caption: "Here's your quote as a PDF." },
+        );
+      }
+
+      // If the item needs human review, log for admin
       if (response.shouldRouteToHuman) {
         console.log(
           `[ROUTE TO HUMAN] chat=${ctx.chat.id} text="${ctx.message.text}"`,
         );
-        // TODO Phase 5: forward to admin group or channel
       }
     } catch (err) {
       console.error("Unhandled error in message handler:", err);

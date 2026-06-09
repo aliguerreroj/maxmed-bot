@@ -9,6 +9,7 @@
  */
 
 import { lookupPrice } from "../engine/lookup.js";
+import { buildQuoteData, generateQuotePDF } from "./quote.js";
 import type {
   PriceLookupRequest,
   PriceRow,
@@ -35,8 +36,10 @@ export interface HandlerDeps {
 export interface BotResponse {
   text: string;
   shouldRouteToHuman: boolean;
-  /** Structured quote data for Phase 5 (PDF generation). */
+  /** Structured quote data for PDF generation. */
   quoteItems: QuoteItem[];
+  /** PDF quote buffer, attached when items are quoted. */
+  pdfBuffer: Buffer | null;
 }
 
 export interface QuoteItem {
@@ -65,7 +68,7 @@ const GREETING_RESPONSE =
   "and I'll give you a quote right away!";
 
 function routeToHuman(text: string): BotResponse {
-  return { text, shouldRouteToHuman: true, quoteItems: [] };
+  return { text, shouldRouteToHuman: true, quoteItems: [], pdfBuffer: null };
 }
 
 /**
@@ -94,6 +97,7 @@ export async function handleMessage(
       text: GREETING_RESPONSE,
       shouldRouteToHuman: false,
       quoteItems: [],
+      pdfBuffer: null,
     };
   }
 
@@ -147,7 +151,19 @@ export async function handleMessage(
     text = buildFallbackResponse(quotedItems, notPurchased, notFound, expiredTooOld);
   }
 
-  return { text, shouldRouteToHuman: needsHuman, quoteItems };
+  // ---- step 4: generate PDF if items were quoted ----
+  let pdfBuffer: Buffer | null = null;
+  if (quoteItems.length > 0) {
+    try {
+      const quoteData = buildQuoteData(quoteItems);
+      pdfBuffer = await generateQuotePDF(quoteData);
+    } catch (err) {
+      console.error("PDF generation failed:", err);
+      // Non-fatal: the text reply still goes out, just without the PDF.
+    }
+  }
+
+  return { text, shouldRouteToHuman: needsHuman, quoteItems, pdfBuffer };
 }
 
 // ---- per-item processing ----

@@ -301,7 +301,50 @@ describe("extraction failure", () => {
   });
 });
 
-// ========== mixed results ==========
+// ========== PDF generation ==========
+
+describe("PDF quote generation", () => {
+  it("generates a PDF buffer when items are quoted", async () => {
+    const r = await handleMessage("test", makeDeps({
+      items: [item({
+        category: "test_strips",
+        productName: "Accu-Chek Aviva plus 100",
+        condition: "mint",
+        expirationDate: "2027-05-15",
+        quantity: 10,
+      })],
+      isGreeting: false,
+    }));
+
+    expect(r.pdfBuffer).not.toBeNull();
+    expect(r.pdfBuffer!.length).toBeGreaterThan(100);
+    // Valid PDF starts with %PDF
+    expect(r.pdfBuffer!.subarray(0, 4).toString()).toBe("%PDF");
+  });
+
+  it("no PDF for greetings", async () => {
+    const r = await handleMessage("test", makeDeps({
+      items: [],
+      isGreeting: true,
+    }));
+
+    expect(r.pdfBuffer).toBeNull();
+  });
+
+  it("no PDF when all items are not_found", async () => {
+    const r = await handleMessage("test", makeDeps({
+      items: [item({
+        category: "test_strips",
+        productName: "Nonexistent Widget",
+        condition: "mint",
+        expirationDate: "2027-05-15",
+      })],
+      isGreeting: false,
+    }));
+
+    expect(r.pdfBuffer).toBeNull();
+  });
+});
 
 describe("mixed: one found, one not_found", () => {
   it("quotes the found item, routes the unknown to human", async () => {
