@@ -246,6 +246,11 @@ export async function handleSessionMessage(
   const session = store.get(chatId);
   const today = deps.today ?? new Date();
 
+  // ---- closing phrase → auto-trigger /quote (skips LLM call) ----
+  if (session.quotedItems.length > 0 && isClosingPhrase(message)) {
+    return handleQuoteCommand(chatId, store);
+  }
+
   // ---- extraction ----
   let extraction: ExtractionResult;
   try {
@@ -640,4 +645,37 @@ export function parseFollowUp(message: string): FollowUpFields {
   }
 
   return result;
+}
+
+// ---- closing phrase detection ----
+
+/**
+ * Detect "that's all" / "no more" / Spanish equivalents.
+ * Runs BEFORE the LLM call — deterministic, zero cost, instant.
+ * Only triggers when the session has accumulated items.
+ */
+const CLOSING_PATTERNS = [
+  // English
+  /\bthat'?s?\s+(?:all|it)\b/i,
+  /\bno\s+(?:more|thanks|thank\s*you)\b/i,
+  /\bnothing\s+(?:else|more)\b/i,
+  /\bi'?m\s+done\b/i,
+  /\bdone$/i,
+  /\ball\s+(?:done|set|good)\b/i,
+  // Spanish
+  /\bsolo\s+eso\b/i,
+  /\bes\s+todo\b/i,
+  /\bya\s+no\s+m[aá]s\b/i,
+  /\bnada\s+m[aá]s\b/i,
+  /\bno\s+m[aá]s\b/i,
+  /\beso\s+es\s+todo\b/i,
+  /\blisto\b/i,
+];
+
+export function isClosingPhrase(message: string): boolean {
+  const trimmed = message.trim();
+  // Short messages only — a long message with "that's all" embedded in a
+  // product description shouldn't trigger the quote.
+  if (trimmed.length > 60) return false;
+  return CLOSING_PATTERNS.some((re) => re.test(trimmed));
 }

@@ -10,6 +10,7 @@ import {
   handleStartCommand,
   handleQuoteCommand,
   parseFollowUp,
+  isClosingPhrase,
   EMPTY_PARTIAL,
   type SessionDeps,
   type PartialItem,
@@ -437,6 +438,120 @@ describe("/start command", () => {
 
     expect(r.text).toContain("MAXMED");
     expect(store.has(1)).toBe(false);
+  });
+});
+
+// ========== closing phrase detection ==========
+
+describe("isClosingPhrase", () => {
+  it.each([
+    "that's all",
+    "That's it",
+    "thats all",
+    "no more",
+    "no thanks",
+    "no thank you",
+    "nothing else",
+    "nothing more",
+    "I'm done",
+    "im done",
+    "done",
+    "all done",
+    "all set",
+    "all good",
+    // Spanish
+    "solo eso",
+    "es todo",
+    "ya no más",
+    "ya no mas",
+    "nada más",
+    "nada mas",
+    "no más",
+    "eso es todo",
+    "listo",
+  ])("detects: %s", (phrase) => {
+    expect(isClosingPhrase(phrase)).toBe(true);
+  });
+
+  it("does not trigger on long messages", () => {
+    expect(
+      isClosingPhrase(
+        "I also have 5 boxes of Accu-Chek Aviva 100 that's all I can find right now",
+      ),
+    ).toBe(false);
+  });
+
+  it("does not trigger on product descriptions", () => {
+    expect(isClosingPhrase("I have Aviva 100 test strips")).toBe(false);
+  });
+});
+
+describe("closing phrase triggers auto-quote", () => {
+  it("'that's all' with queued items → summary + PDF", async () => {
+    const store = new SessionStore();
+    const session = store.get(1);
+    session.quotedItems.push({
+      productName: "Accu-Chek Aviva plus 100",
+      reference: null,
+      condition: "mint",
+      quantity: 10,
+      unitPrice: 60,
+      totalPrice: 600,
+      basePriceId: 1,
+    });
+
+    // The extract function should NOT be called (closing is detected first)
+    const deps: SessionDeps = {
+      extract: async () => { throw new Error("should not be called"); },
+      queryPrices: async () => [],
+      rules: rulesMap,
+      today: TODAY,
+    };
+
+    const r = await handleSessionMessage(1, "that's all", store, deps);
+
+    expect(r.text).toContain("$600");
+    expect(r.pdfBuffer).not.toBeNull();
+    expect(r.pdfBuffer!.subarray(0, 4).toString()).toBe("%PDF");
+    // Session should be cleared
+    expect(store.has(1)).toBe(false);
+  });
+
+  it("'nada más' with queued items → same result", async () => {
+    const store = new SessionStore();
+    const session = store.get(1);
+    session.quotedItems.push({
+      productName: "FREESTYLE LIBRE 3",
+      reference: null,
+      condition: "damaged",
+      quantity: 5,
+      unitPrice: 27,
+      totalPrice: 135,
+      basePriceId: 2,
+    });
+
+    const deps: SessionDeps = {
+      extract: async () => { throw new Error("should not be called"); },
+      queryPrices: async () => [],
+      rules: rulesMap,
+      today: TODAY,
+    };
+
+    const r = await handleSessionMessage(1, "nada más", store, deps);
+
+    expect(r.text).toContain("$135");
+    expect(r.pdfBuffer).not.toBeNull();
+  });
+
+  it("closing phrase with NO queued items → goes to extraction (not auto-quote)", async () => {
+    const store = new SessionStore();
+
+    const deps = makeDeps({ items: [], isGreeting: true });
+    // Should reach extraction without error (no items → greeting)
+    const r = await handleSessionMessage(1, "that's all", store, deps);
+
+    expect(r.pdfBuffer).toBeNull();
+    expect(r.text).toContain("MAXMED");
   });
 });
 
