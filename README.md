@@ -30,7 +30,7 @@ tracing it to the exact DB row.
 
 TypeScript + Node 22, [grammy](https://grammy.dev) (Telegram),
 Claude API (Haiku for extraction and phrasing), PostgreSQL 17 + Prisma,
-PDFKit (quote PDF), ExcelJS (parser), Vitest (grounding tests).
+PDFKit (quote PDF), ExcelJS (parser), Vitest (217 grounding + pipeline tests).
 No n8n, no vector search — pricing is exact lookup.
 
 ## Data model (two tables)
@@ -39,11 +39,63 @@ No n8n, no vector search — pricing is exact lookup.
   `(category, productName, reference)` × `condition`
   (`mint` / `damaged` / `short_date` / `expired`) × an explicit expiration
   date range (`dateFrom`/`dateTo`, matched newest→oldest, first match wins;
-  null range = non-expiring / flat condition).
+  null range = non-expiring / flat condition). Price is nullable — `null`
+  means "not currently purchased" (e.g. damaged test strips today), and the
+  owner can re-enable it by editing the Excel and re-importing. Zero code
+  changes.
 - **`AdjustmentRule`** — ding deltas only (e.g. `−3.00`). Linked to mint
   rows via `scopeKey`. Changing a ding from −$3 to −$4 is a one-row edit.
 
 See `prisma/schema.prisma` for annotated definitions.
+
+## Conversation flow
+
+The bot supports multi-turn conversations with incremental information
+gathering and multi-item accumulation.
+
+**Session memory.** Each Telegram chat has an in-memory session
+(`Map<chatId, Session>`) that stores partially-extracted fields and
+accumulated quote items. When a new message arrives, the LLM extracts
+whatever fields are present, and the session merge fills in the rest from
+previous messages. This handles the natural "partial info → follow-up"
+flow:
+
+```
+Seller: "I have some Aviva 100 test strips"
+Bot:    "Got it! I still need: the expiration date; how many boxes/packs"
+
+Seller: "exp May 2027, 10 boxes"
+Bot:    "✅ Accu-Chek Aviva plus 100, mint: 10 × $60/unit — total $600
+         Anything else to add?"
+```
+
+A deterministic regex fallback (English + Spanish) catches dates,
+quantities, and conditions when the LLM returns zero items for a follow-up
+message that has no product name.
+
+**Multi-item accumulation.** After each quoted item, the bot asks "Anything
+else to add?" and stores the item in the session. The seller can keep adding
+items across multiple messages.
+
+**`/quote` command.** Generates a combined PDF with all accumulated items,
+a grand total, and 7-day validity terms, then clears the session.
+
+**Auto-quote on closing phrases.** When the seller says "that's all",
+"no more", "solo eso", "nada más", or similar (detected by a deterministic
+regex before the LLM call — zero cost, instant), the bot automatically
+triggers the `/quote` flow.
+
+**`/start` command.** Clean welcome message explaining what the bot does
+and what info to provide. Clears any existing session.
+
+**Unrecognized products.** If the seller names a product not in the catalog
+(e.g. "Omnipod Dash pods"), the extraction returns `rawProductDescription`
+with the seller's text. The session handler detects this and routes to a
+human immediately — it never asks "which product?" for something that isn't
+on the sheet.
+
+**Auto-clear.** Sessions expire after 10 minutes of inactivity via
+`setTimeout` per session.
 
 ## Project structure
 
@@ -60,9 +112,10 @@ src/
     lookup.ts        Pure function: (request, data, today) → result
     query.ts         Prisma ↔ engine type bridge
     types.ts         Engine request/result types with provenance
-  bot/           Telegram bot + LLM calls
-    index.ts         grammy entry point, startup loading
-    handler.ts       Pipeline orchestrator (extract → lookup → phrase → PDF)
+  bot/           Telegram bot + LLM calls + session management
+    index.ts         grammy entry point, /start, /quote, startup loading
+    session.ts       Session store, merge logic, follow-up regex, closing detection
+    handler.ts       Direct pipeline (extract → lookup → phrase → PDF)
     extraction.ts    Extraction LLM (tool_use, forced structured output)
     phrasing.ts      Phrasing LLM (states exact prices, no math)
     catalog.ts       Product catalog builder (names only, never prices)
@@ -71,13 +124,15 @@ src/
     db.ts            Prisma client singleton
     env.ts           Typed, lazy environment access
   import.ts        npm run import — transactional DB rebuild
-tests/
+tests/               217 tests across 8 files
   dates.test.ts      Header parsing (15 tests)
   testStrips.test.ts Parser vs real sheet (26 tests)
   libre.test.ts      Parser vs real sheet (25 tests)
   dexcom.test.ts     Parser vs real sheet (30 tests)
   engine.test.ts     Grounding evals (42 tests)
   handler.test.ts    Pipeline wiring with mocked LLMs (15 tests)
+  session.test.ts    Session merge, accumulation, auto-quote, regex fallback (63 tests)
+  scaffold.test.ts   Harness smoke test (1 test)
 ```
 
 ## Setup (Windows + PowerShell, Node 22, PostgreSQL 17)
@@ -98,7 +153,7 @@ npm run db:migrate    # name the first migration "init"
 npm run import        # reads data/price-sheet.xlsx, loads 136 prices + 5 rules
 
 # 5. Run the test suite
-npm test              # 151+ tests, all should pass
+npm test              # 217 tests across 8 files, all should pass
 
 # 6. Start the bot
 npm run dev           # watches for changes
@@ -122,17 +177,53 @@ After import, restart the bot to refresh the in-memory catalog and rules.
 The bot only ever asks about the supplies — **never about or implying the
 seller's health**. This rule is enforced in both LLM system prompts.
 
-## Future steps
+## Production considerations
+
+**Date tier rollover.** The data notes say "dates roll on the 22nd of each
+month." The import script (`npm run import`) rebuilds the entire DB from the
+Excel in one transaction. In production, a scheduled job (cron) or an upload
+trigger (file-watcher, Sheets API webhook) runs the same pipeline
+automatically. The parser adapts to whatever tiers the owner puts in the
+sheet — no code changes needed when tiers shift.
+
+**Damaged test strips.** The data notes say "damaged test strips are no
+longer accepted but can change next month." In the current data, the damaged
+column for test strips is N/A → no `BasePrice` rows are created for that
+condition. When the owner decides to accept them again, they put a price in
+the Excel cell, run `npm run import`, and the bot reflects it immediately.
+Zero code changes — the parser emits whatever the sheet contains, and the
+engine either finds a matching row or returns "not purchased."
+
+## What I'd do with another week
+
+- **Smart disambiguation.** When the extraction maps to multiple possible
+  products (e.g. "DEXCOM SENSOR 1 PACK" could be G6 or G7, BOX or NO BOX),
+  the bot should present the options and let the seller pick rather than
+  routing to a human. This requires a disambiguation step between extraction
+  and engine lookup that queries the DB for matching candidates.
 
 - **Product table.** An item where every tier is N/A (e.g. Accu-Chek Guide
   50 MO) produces zero `BasePrice` rows and is indistinguishable from an item
-  not on the sheet. A `Product` table recording all listed items would restore
-  the informational "we don't buy that right now" vs. handoff distinction.
-- **Auto-sync.** Scheduled job or Sheets API so the owner's edits flow into
-  the DB without manual `npm run import`.
-- **Admin forwarding.** Route-to-human messages forwarded to a Telegram admin
-  group or channel for follow-up.
-- **Multi-turn clarification.** Ask follow-up questions for missing fields
-  (expiration date, quantity) instead of routing to human immediately.
-- **Fuzzy product matching.** Tolerate minor name mismatches between the LLM
-  extraction and DB product names to reduce false not-found results.
+  not on the sheet at all. A `Product` table recording every listed item —
+  including all-N/A ones — would restore the informational "we know this
+  item but aren't buying it right now" vs. "let me connect you with a
+  team member" distinction.
+
+- **Persistent sessions.** The current in-memory `Map` is wiped on bot
+  restart. A Redis-backed session store would survive restarts and support
+  horizontal scaling across multiple bot instances.
+
+- **Auto-sync from Google Sheets.** The owner's workflow is editing a Google
+  Sheet. A Sheets API integration (webhook or polling) would detect changes
+  and run the import pipeline automatically, removing the manual
+  `npm run import` step entirely.
+
+- **Admin Telegram group forwarding.** Route-to-human cases currently log to
+  the console. Forwarding the seller's message (plus session context) to a
+  private Telegram admin group would let the team respond directly without
+  checking logs.
+
+- **Grounding eval dashboard.** Track extraction accuracy, engine hit/miss
+  rates, and route-to-human frequency over time. Flag conversations where the
+  LLM extraction diverged from what the engine found, so the team can tune
+  the extraction prompt or catalog coverage.
