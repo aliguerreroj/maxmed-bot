@@ -47,6 +47,26 @@ async function main(): Promise<void> {
     extract,
     queryPrices: (cat, name, ref) =>
       queryProductPrices(prisma, cat, name, ref),
+    searchProducts: async (partialName) => {
+      const rows = await prisma.basePrice.findMany({
+        where: {
+          productName: { contains: partialName, mode: "insensitive" },
+        },
+        select: { category: true, productName: true },
+        distinct: ["category", "productName"],
+        orderBy: [{ category: "asc" }, { productName: "asc" }],
+      });
+      return rows;
+    },
+    queryReferences: async (category, productName) => {
+      const rows = await prisma.basePrice.findMany({
+        where: { category, productName, reference: { not: null } },
+        select: { reference: true },
+        distinct: ["reference"],
+        orderBy: [{ reference: "asc" }],
+      });
+      return rows.map((r: any) => r.reference as string);
+    },
     rules,
   };
 

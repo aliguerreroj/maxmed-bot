@@ -11,9 +11,12 @@ import {
   handleQuoteCommand,
   parseFollowUp,
   isClosingPhrase,
+  resolveDisambiguation,
+  resolveReference,
   EMPTY_PARTIAL,
   type SessionDeps,
   type PartialItem,
+  type DisambiguationState,
 } from "../src/bot/session.js";
 import type { ExtractionResult, ExtractionItem } from "../src/bot/extraction.js";
 import type { PriceRow, DingRule } from "../src/engine/types.js";
@@ -76,6 +79,32 @@ function makeDeps(extraction: ExtractionResult): SessionDeps {
           r.productName === name &&
           r.reference === ref,
       ),
+    searchProducts: async (partial) => {
+      const lower = partial.toLowerCase();
+      const seen = new Set<string>();
+      return allRows
+        .filter((r) => r.productName.toLowerCase().includes(lower))
+        .filter((r) => {
+          const key = `${r.category}:${r.productName}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .map((r) => ({ category: r.category, productName: r.productName }));
+    },
+    queryReferences: async (cat, name) => {
+      const refs = new Set<string>();
+      allRows.forEach((r) => {
+        if (
+          r.category === cat &&
+          r.productName === name &&
+          r.reference !== null
+        ) {
+          refs.add(r.reference);
+        }
+      });
+      return [...refs].sort();
+    },
     rules: rulesMap,
     today: TODAY,
   };
@@ -207,7 +236,7 @@ describe("session: partial → follow-up → quote", () => {
 
     const r = await handleSessionMessage(1, "test", store, deps);
 
-    expect(r.text).toContain("expiration date");
+    expect(r.text).toContain("expire");
     expect(r.shouldRouteToHuman).toBe(false);
 
     // Session should have the partial stored
@@ -235,7 +264,7 @@ describe("session: partial → follow-up → quote", () => {
     const r = await handleSessionMessage(1, "exp may 2027, 10 boxes", store, deps2);
 
     expect(r.text).toContain("$60");
-    expect(r.text).toContain("✅");
+    expect(r.text).toContain("we can offer");
 
     const session = store.get(1);
     expect(session.quotedItems.length).toBe(1);
@@ -307,7 +336,7 @@ describe("session: partial → follow-up → quote", () => {
 
     // Should complete the quote with merged data
     expect(r.text).toContain("$60");
-    expect(r.text).toContain("✅");
+    expect(r.text).toContain("we can offer");
 
     const session = store.get(1);
     expect(session.quotedItems.length).toBe(1);
@@ -350,7 +379,7 @@ describe("session: multi-item accumulation", () => {
     expect(session.quotedItems[1]!.unitPrice).toBe(27);
 
     // Response should mention the queue count
-    expect(r2.text).toContain("2 item(s)");
+    expect(r2.text).toContain("2 items");
   });
 });
 
@@ -459,6 +488,10 @@ describe("isClosingPhrase", () => {
     "all done",
     "all set",
     "all good",
+    "all ready",
+    "already",
+    "no, all ready",
+    "no, already",
     // Spanish
     "solo eso",
     "es todo",
@@ -503,6 +536,8 @@ describe("closing phrase triggers auto-quote", () => {
     // The extract function should NOT be called (closing is detected first)
     const deps: SessionDeps = {
       extract: async () => { throw new Error("should not be called"); },
+      searchProducts: async () => [],
+      queryReferences: async () => [],
       queryPrices: async () => [],
       rules: rulesMap,
       today: TODAY,
@@ -532,6 +567,8 @@ describe("closing phrase triggers auto-quote", () => {
 
     const deps: SessionDeps = {
       extract: async () => { throw new Error("should not be called"); },
+      searchProducts: async () => [],
+      queryReferences: async () => [],
       queryPrices: async () => [],
       rules: rulesMap,
       today: TODAY,
@@ -653,6 +690,316 @@ describe("unrecognized product: LLM returns 0 items (safety net)", () => {
   });
 });
 
+// ========== smart disambiguation ==========
+
+describe("disambiguation: partial product name → present options", () => {
+  it('"Accu-Chek Aviva plus" matches 3 variants and presents numbered list', async () => {
+    const store = new SessionStore();
+    const deps = makeDeps({
+      items: [item({
+        rawProductDescription: "Accu-Chek Aviva plus",
+        condition: "mint",
+        quantity: 10,
+      })],
+      isGreeting: false,
+    });
+
+    const r = await handleSessionMessage(1, "I have Accu-Chek Aviva plus", store, deps);
+
+    expect(r.text).toContain("1.");
+    expect(r.text).toContain("2.");
+    expect(r.text).toContain("Accu-Chek Aviva plus 100");
+    expect(r.text).toContain("Accu-Chek Aviva plus 50");
+    expect(r.shouldRouteToHuman).toBe(false);
+
+    // Session should have disambiguation state stored
+    const session = store.get(1);
+    expect(session.disambiguation).toBeDefined();
+    expect(session.disambiguation!.candidates.length).toBeGreaterThanOrEqual(2);
+    // Other fields should be preserved for after selection
+    expect(session.disambiguation!.baseItem.quantity).toBe(10);
+    expect(session.disambiguation!.baseItem.condition).toBe("mint");
+  });
+
+  it("works when LLM sets productName but NOT rawProductDescription", async () => {
+    const store = new SessionStore();
+    // This is the key failure case: LLM sets a partial productName
+    // (e.g. "Accu-Chek Aviva plus") but no rawProductDescription.
+    // Disambiguation should still trigger via the searchHint fallback.
+    const deps = makeDeps({
+      items: [item({
+        category: "test_strips",
+        productName: "Accu-Chek Aviva plus", // partial, not exact match
+        rawProductDescription: null, // LLM didn't set this
+        condition: "mint",
+        quantity: 10,
+      })],
+      isGreeting: false,
+    });
+
+    const r = await handleSessionMessage(1, "I have Accu-Chek Aviva plus", store, deps);
+
+    // Should show disambiguation, NOT "I just need a few more details"
+    expect(r.text).toContain("1.");
+    expect(r.text).toContain("Accu-Chek Aviva plus 100");
+    expect(r.shouldRouteToHuman).toBe(false);
+  });
+
+  it("seller replies with number → resolves and quotes", async () => {
+    const store = new SessionStore();
+
+    // Step 1: trigger disambiguation
+    const deps1 = makeDeps({
+      items: [item({
+        rawProductDescription: "Accu-Chek Aviva plus",
+        condition: "mint",
+        expirationDate: "2027-05-15",
+        quantity: 10,
+      })],
+      isGreeting: false,
+    });
+    await handleSessionMessage(1, "Aviva plus", store, deps1);
+
+    // Step 2: seller picks option 1 (Accu-Chek Aviva plus 100)
+    const deps2 = makeDeps({ items: [], isGreeting: false });
+    const r = await handleSessionMessage(1, "1", store, deps2);
+
+    expect(r.text).toContain("$60");
+    expect(r.text).toContain("we can offer");
+    expect(r.text).toContain("$600");
+
+    const session = store.get(1);
+    expect(session.quotedItems.length).toBe(1);
+    expect(session.disambiguation).toBeUndefined();
+  });
+
+  it("seller replies with product name → resolves and quotes", async () => {
+    const store = new SessionStore();
+
+    const deps1 = makeDeps({
+      items: [item({
+        rawProductDescription: "Accu-Chek Aviva plus",
+        condition: "mint",
+        expirationDate: "2027-05-15",
+        quantity: 5,
+      })],
+      isGreeting: false,
+    });
+    await handleSessionMessage(1, "Aviva plus", store, deps1);
+
+    // Seller types the name instead of a number
+    const deps2 = makeDeps({ items: [], isGreeting: false });
+    const r = await handleSessionMessage(1, "Aviva plus 50", store, deps2);
+
+    expect(r.text).toContain("we can offer");
+    // Should match "Accu-Chek Aviva plus 50" (contains "50")
+
+    const session = store.get(1);
+    expect(session.quotedItems.length).toBe(1);
+    expect(session.quotedItems[0]!.productName).toContain("50");
+  });
+});
+
+describe("disambiguation: single match → auto-selects", () => {
+  it('"Contour 50ct MO" has only one match → quotes directly', async () => {
+    const store = new SessionStore();
+    const deps = makeDeps({
+      items: [item({
+        rawProductDescription: "Contour 50ct MO",
+        condition: "mint",
+        expirationDate: "2027-05-15",
+        quantity: 5,
+      })],
+      isGreeting: false,
+    });
+
+    const r = await handleSessionMessage(1, "Contour 50ct MO", store, deps);
+
+    // Single match → should auto-select and quote, no numbered list
+    expect(r.text).toContain("we can offer");
+    expect(r.text).not.toContain("1.");
+    expect(r.text).toContain("$8"); // Contour 50ct MO = $8
+
+    const session = store.get(1);
+    expect(session.quotedItems.length).toBe(1);
+  });
+});
+
+describe("resolveDisambiguation", () => {
+  const state: DisambiguationState = {
+    candidates: [
+      { category: "test_strips", productName: "Accu-Chek Aviva plus 100" },
+      { category: "test_strips", productName: "Accu-Chek Aviva plus 50" },
+      { category: "test_strips", productName: "Accu-Chek Aviva plus 50 MO" },
+    ],
+    baseItem: { ...EMPTY_PARTIAL },
+  };
+
+  it("resolves by number", () => {
+    expect(resolveDisambiguation("1", state)?.productName).toBe("Accu-Chek Aviva plus 100");
+    expect(resolveDisambiguation("2", state)?.productName).toBe("Accu-Chek Aviva plus 50");
+    expect(resolveDisambiguation("3", state)?.productName).toBe("Accu-Chek Aviva plus 50 MO");
+  });
+
+  it("resolves by partial name match", () => {
+    expect(resolveDisambiguation("100", state)?.productName).toBe("Accu-Chek Aviva plus 100");
+    expect(resolveDisambiguation("50 MO", state)?.productName).toBe("Accu-Chek Aviva plus 50 MO");
+  });
+
+  it("returns null for out-of-range number", () => {
+    expect(resolveDisambiguation("4", state)).toBeNull();
+    expect(resolveDisambiguation("0", state)).toBeNull();
+  });
+
+  it("returns null for unrelated text", () => {
+    expect(resolveDisambiguation("hello world", state)).toBeNull();
+  });
+});
+
+// ========== Dexcom reference handling ==========
+
+describe("Dexcom: reference prompt after disambiguation", () => {
+  it("DEXCOM SENSOR 1 PACK (Non-15 Day) → asks for reference with list", async () => {
+    const store = new SessionStore();
+
+    // Step 1: disambiguation shows Dexcom variants
+    const deps1 = makeDeps({
+      items: [item({
+        rawProductDescription: "DEXCOM SENSOR 1 PACK",
+      })],
+      isGreeting: false,
+    });
+    await handleSessionMessage(1, "I have DEXCOM SENSOR 1 PACK", store, deps1);
+
+    // Step 2: seller picks a variant (disambiguation resolves it)
+    const session = store.get(1);
+    // Simulate direct disambiguation resolution — set the state manually
+    session.disambiguation = {
+      candidates: [
+        { category: "dexcom_g7", productName: "DEXCOM SENSOR 1 PACK (Non-15 Day)" },
+        { category: "dexcom_g7", productName: "DEXCOM SENSOR 1 PACK (15 Day)" },
+      ],
+      baseItem: { ...EMPTY_PARTIAL, condition: "mint" },
+    };
+
+    const deps2 = makeDeps({ items: [], isGreeting: false });
+    const r = await handleSessionMessage(1, "1", store, deps2);
+
+    // Should ask for reference, NOT hang
+    expect(r.text).toContain("reference");
+    expect(r.text).toContain("011");
+    expect(r.text).toContain("013");
+    expect(r.shouldRouteToHuman).toBe(false);
+
+    // Session should have pendingReferences set
+    const updated = store.get(1);
+    expect(updated.pendingReferences).toBeDefined();
+    expect(updated.pendingReferences!.length).toBeGreaterThan(1);
+  });
+
+  it("seller replies with reference code → completes the quote", async () => {
+    const store = new SessionStore();
+    const session = store.get(1);
+
+    // Set up state as if reference was just asked
+    session.partial = {
+      category: "dexcom_g7",
+      productName: "DEXCOM SENSOR 1 PACK (Non-15 Day)",
+      reference: null,
+      condition: "mint",
+      expirationDate: "2027-01-15",
+      quantity: 3,
+    };
+    session.pendingReferences = ["011", "013", "030", "012"];
+
+    const deps = makeDeps({ items: [], isGreeting: false });
+    const r = await handleSessionMessage(1, "012", store, deps);
+
+    // Should complete the lookup: Non-15 Day ref 012 = $75
+    expect(r.text).toContain("$75");
+    expect(r.text).toContain("we can offer");
+    expect(r.text).toContain("$225"); // 3 × $75
+
+    const updated = store.get(1);
+    expect(updated.quotedItems.length).toBe(1);
+    expect(updated.pendingReferences).toBeUndefined();
+  });
+
+  it("seller replies with number → selects from reference list", async () => {
+    const store = new SessionStore();
+    const session = store.get(1);
+
+    session.partial = {
+      category: "dexcom_g7",
+      productName: "DEXCOM SENSOR 1 PACK (15 Day)",
+      reference: null,
+      condition: "mint",
+      expirationDate: "2027-01-15",
+      quantity: 2,
+    };
+    session.pendingReferences = ["010", "011", "012", "013", "016"];
+
+    const deps = makeDeps({ items: [], isGreeting: false });
+    // "3" → third reference = "012"
+    const r = await handleSessionMessage(1, "3", store, deps);
+
+    expect(r.text).toContain("$100"); // 15 Day ref 012 = $100
+    expect(r.text).toContain("we can offer");
+
+    const updated = store.get(1);
+    expect(updated.quotedItems[0]!.reference).toBe("012");
+  });
+
+  it("auto-selects when only one reference exists", async () => {
+    const store = new SessionStore();
+
+    // DEXCOM SENSOR 1 PACK (NO BOX/LOOSE) has only one reference: "OR & OM"
+    const deps = makeDeps({
+      items: [item({
+        category: "dexcom_g6",
+        productName: "DEXCOM SENSOR 1 PACK (NO BOX/LOOSE)",
+        condition: "mint",
+        expirationDate: "2027-01-15",
+        quantity: 1,
+      })],
+      isGreeting: false,
+    });
+
+    const r = await handleSessionMessage(1, "test", store, deps);
+
+    // Single ref → auto-select, quote directly: $40
+    expect(r.text).toContain("$40");
+    expect(r.text).toContain("we can offer");
+  });
+});
+
+describe("resolveReference", () => {
+  const refs = ["011", "013", "030", "012"];
+
+  it("resolves by number", () => {
+    expect(resolveReference("1", refs)).toBe("011");
+    expect(resolveReference("4", refs)).toBe("012");
+  });
+
+  it("resolves by exact code", () => {
+    expect(resolveReference("013", refs)).toBe("013");
+    expect(resolveReference("030", refs)).toBe("030");
+  });
+
+  it("resolves case-insensitively", () => {
+    expect(resolveReference("OE", ["OE", "OR"])).toBe("OE");
+    expect(resolveReference("oe", ["OE", "OR"])).toBe("OE");
+  });
+
+  it("resolves substring match", () => {
+    expect(resolveReference("the OR & OM one", ["OR & OM", "OE"])).toBe("OR & OM");
+  });
+
+  it("returns null for no match", () => {
+    expect(resolveReference("xyz", refs)).toBeNull();
+  });
+});
+
 // ========== parseFollowUp (regex fallback) ==========
 
 describe("parseFollowUp", () => {
@@ -734,7 +1081,7 @@ describe("session: regex fallback when LLM returns 0 items", () => {
 
     // Should complete the quote via regex fallback + session merge
     expect(r.text).toContain("$60");
-    expect(r.text).toContain("✅");
+    expect(r.text).toContain("we can offer");
 
     const session = store.get(1);
     expect(session.quotedItems.length).toBe(1);
@@ -755,7 +1102,7 @@ describe("session: regex fallback when LLM returns 0 items", () => {
     const r = await handleSessionMessage(1, "vencen mayo 2027, 10 cajas, selladas", store, deps2);
 
     expect(r.text).toContain("$60");
-    expect(r.text).toContain("✅");
+    expect(r.text).toContain("we can offer");
   });
 });
 

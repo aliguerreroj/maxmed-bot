@@ -46,9 +46,18 @@ export const EMPTY_PARTIAL: PartialItem = {
 
 // ---- session ----
 
+export interface DisambiguationState {
+  candidates: Array<{ category: string; productName: string }>;
+  /** The other extracted fields to carry forward after the seller picks a product. */
+  baseItem: PartialItem;
+}
+
 export interface Session {
   partial: PartialItem;
   quotedItems: QuoteItem[];
+  disambiguation?: DisambiguationState;
+  /** Available reference codes when a Dexcom product is selected but no ref given. */
+  pendingReferences?: string[];
   lastActivity: number;
   timeoutId?: ReturnType<typeof setTimeout>;
 }
@@ -155,6 +164,13 @@ export interface SessionDeps {
     productName: string,
     reference: string | null,
   ) => Promise<PriceRow[]>;
+  searchProducts: (
+    partialName: string,
+  ) => Promise<Array<{ category: string; productName: string }>>;
+  queryReferences: (
+    category: string,
+    productName: string,
+  ) => Promise<string[]>;
   rules: Map<string, DingRule>;
   today?: Date;
 }
@@ -212,7 +228,7 @@ export async function handleQuoteCommand(
   }
 
   // Build summary text
-  const lines = session.quotedItems.map(formatItemLine);
+  const lines = session.quotedItems.map(formatQuoteLine);
   let grandTotal: number | null = 0;
   for (const item of session.quotedItems) {
     if (item.totalPrice === null) {
@@ -246,9 +262,83 @@ export async function handleSessionMessage(
   const session = store.get(chatId);
   const today = deps.today ?? new Date();
 
+  // ---- pending reference resolution (skips LLM call) ----
+  if (session.pendingReferences && session.pendingReferences.length > 0) {
+    const ref = resolveReference(message, session.pendingReferences);
+    if (ref) {
+      session.partial = { ...session.partial, reference: ref };
+      session.pendingReferences = undefined;
+      const result = await processSessionItem(
+        session.partial, session, deps, today, null, true,
+      );
+      const parts = [result.text];
+      if (session.quotedItems.length > 0) {
+        parts.push(queueReminder(session.quotedItems.length));
+      }
+      return {
+        text: parts.join("\n\n"),
+        shouldRouteToHuman: result.routeToHuman,
+        pdfBuffer: null,
+      };
+    }
+    // Couldn't resolve — clear and fall through to extraction
+    session.pendingReferences = undefined;
+  }
+
   // ---- closing phrase → auto-trigger /quote (skips LLM call) ----
   if (session.quotedItems.length > 0 && isClosingPhrase(message)) {
     return handleQuoteCommand(chatId, store);
+  }
+
+  // ---- disambiguation reply (skips LLM call) ----
+  if (session.disambiguation) {
+    try {
+      const resolved = resolveDisambiguation(message, session.disambiguation);
+      if (resolved) {
+        const enriched: PartialItem = {
+          ...session.disambiguation.baseItem,
+          category: resolved.category,
+          productName: resolved.productName,
+        };
+        session.disambiguation = undefined;
+        session.partial = { ...EMPTY_PARTIAL };
+
+        // Dexcom products need a reference — check before engine lookup
+        const refResult = await checkReferenceNeeded(
+          enriched, session, deps,
+        );
+        if (refResult) {
+          const parts = [refResult.text];
+          if (session.quotedItems.length > 0) {
+            parts.push(queueReminder(session.quotedItems.length));
+          }
+          return { text: parts.join("\n\n"), shouldRouteToHuman: false, pdfBuffer: null };
+        }
+
+        const result = await processSessionItem(
+          enriched, session, deps, today, null, true,
+        );
+        const parts = [result.text];
+        if (session.quotedItems.length > 0) {
+          parts.push(queueReminder(session.quotedItems.length));
+        }
+        return {
+          text: parts.join("\n\n"),
+          shouldRouteToHuman: result.routeToHuman,
+          pdfBuffer: null,
+        };
+      }
+      // Couldn't resolve — clear disambiguation and fall through to normal extraction
+      session.disambiguation = undefined;
+    } catch (err) {
+      console.error("Disambiguation resolution failed:", err);
+      session.disambiguation = undefined;
+      return {
+        text: "Something went wrong. Could you describe the item again?",
+        shouldRouteToHuman: false,
+        pdfBuffer: null,
+      };
+    }
   }
 
   // ---- extraction ----
@@ -287,9 +377,7 @@ export async function handleSessionMessage(
       const result = await processSessionItem(enriched, session, deps, today);
       const parts = [result.text];
       if (session.quotedItems.length > 0) {
-        parts.push(
-          `📋 ${session.quotedItems.length} item(s) in your quote. Send /quote anytime for the PDF.`,
-        );
+        parts.push(queueReminder(session.quotedItems.length));
       }
       return {
         text: parts.join("\n\n"),
@@ -329,64 +417,54 @@ export async function handleSessionMessage(
   const responses: string[] = [];
   let routeToHuman = false;
 
-  // First item: check for unrecognized product BEFORE merging.
-  // If the seller named a product the LLM couldn't match (rawProductDescription
-  // is set, but category/productName are null), route to human immediately.
+  // First item: merge with session partial, then process.
+  // Pass rawProductDescription as a search hint for disambiguation —
+  // but disambiguation also triggers when the product identity is
+  // incomplete or doesn't match the DB, regardless of this hint.
   const firstItem = extraction.items[0]!;
-  const isUnrecognized =
-    !firstItem.category &&
-    !firstItem.productName &&
-    !!firstItem.rawProductDescription;
 
-  if (isUnrecognized) {
+  // Pre-merge guard: if the extraction names a product the LLM couldn't match
+  // (rawProductDescription set but no identity), the seller is describing
+  // something new — clear the session partial to prevent the old product
+  // identity from carrying over into the merge.
+  if (
+    firstItem.rawProductDescription &&
+    !firstItem.category &&
+    !firstItem.productName
+  ) {
     session.partial = { ...EMPTY_PARTIAL };
-    const desc = firstItem.rawProductDescription!;
-    responses.push(
-      `"${desc}" isn't on our current price list. ` +
-        `Let me connect you with a team member for a manual quote.`,
-    );
-    routeToHuman = true;
-  } else {
-    const merged = mergePartial(session.partial, firstItem);
-    const firstResult = await processSessionItem(merged, session, deps, today);
-    responses.push(firstResult.text);
-    if (firstResult.routeToHuman) routeToHuman = true;
   }
+
+  const merged = mergePartial(session.partial, firstItem);
+  const firstHint = firstItem.rawProductDescription ?? firstItem.productName ?? null;
+  const firstResult = await processSessionItem(
+    merged, session, deps, today, firstHint,
+  );
+  responses.push(firstResult.text);
+  if (firstResult.routeToHuman) routeToHuman = true;
 
   // Additional items (if multi-item message): process independently
   for (let i = 1; i < extraction.items.length; i++) {
     const extraItem = extraction.items[i]!;
-    const extraUnrecognized =
-      !extraItem.category &&
-      !extraItem.productName &&
-      !!extraItem.rawProductDescription;
-
-    if (extraUnrecognized) {
-      responses.push(
-        `"${extraItem.rawProductDescription!}" isn't on our current price list. ` +
-          `Let me connect you with a team member for a manual quote.`,
-      );
-      routeToHuman = true;
-    } else {
-      const asPartial: PartialItem = {
-        category: extraItem.category,
-        productName: extraItem.productName,
-        reference: extraItem.reference,
-        condition: extraItem.condition,
-        expirationDate: extraItem.expirationDate,
-        quantity: extraItem.quantity,
-      };
-      const result = await processSessionItem(asPartial, session, deps, today);
-      responses.push(result.text);
-      if (result.routeToHuman) routeToHuman = true;
-    }
+    const asPartial: PartialItem = {
+      category: extraItem.category,
+      productName: extraItem.productName,
+      reference: extraItem.reference,
+      condition: extraItem.condition,
+      expirationDate: extraItem.expirationDate,
+      quantity: extraItem.quantity,
+    };
+    const extraHint = extraItem.rawProductDescription ?? extraItem.productName ?? null;
+    const result = await processSessionItem(
+      asPartial, session, deps, today, extraHint,
+    );
+    responses.push(result.text);
+    if (result.routeToHuman) routeToHuman = true;
   }
 
   // Queue reminder
   if (session.quotedItems.length > 0) {
-    responses.push(
-      `📋 ${session.quotedItems.length} item(s) in your quote. Send /quote anytime for the PDF.`,
-    );
+    responses.push(queueReminder(session.quotedItems.length));
   }
 
   return {
@@ -403,15 +481,67 @@ async function processSessionItem(
   session: Session,
   deps: SessionDeps,
   today: Date,
+  searchHint?: string | null,
+  skipDisambiguation?: boolean,
 ): Promise<{ text: string; routeToHuman: boolean }> {
-  // Check minimum identity fields
+  // ---- disambiguation for incomplete identity ----
   if (!merged.category || !merged.productName) {
+    if (skipDisambiguation) {
+      session.partial = { ...merged };
+      return { text: askForMissing(merged), routeToHuman: false };
+    }
+    // We have partial info. Try to find matching products in the DB.
+    const term = searchHint ?? merged.productName;
+    if (term) {
+      const result = await attemptDisambiguation(term, merged, session, deps, today);
+      if (result) return result;
+      // Had a search term but no DB matches. If the seller described a
+      // specific product (searchHint set), route to human — they named
+      // something that's not on our sheet.
+      if (searchHint) {
+        session.partial = { ...EMPTY_PARTIAL };
+        return {
+          text:
+            `"${searchHint}" isn't on our current price list. ` +
+            `Let me connect you with a team member who can help.`,
+          routeToHuman: true,
+        };
+      }
+    } else if (merged.category) {
+      // No search term at all, but we know the category.
+      // List all products in this category for the seller to pick from.
+      const allInCategory = await deps.searchProducts("");
+      const categoryProducts = allInCategory.filter(
+        (c) => c.category === merged.category,
+      );
+      if (
+        categoryProducts.length > 0 &&
+        categoryProducts.length <= MAX_DISAMBIGUATION_OPTIONS
+      ) {
+        session.disambiguation = {
+          candidates: categoryProducts,
+          baseItem: { ...merged, productName: null },
+        };
+        session.partial = { ...EMPTY_PARTIAL };
+        return {
+          text: formatDisambiguation("that category", categoryProducts),
+          routeToHuman: false,
+        };
+      }
+      // Too many or zero → fall through to askForMissing
+    }
+    // No search term or no searchHint → ask for more info
     session.partial = { ...merged };
     return { text: askForMissing(merged), routeToHuman: false };
   }
 
   // Default condition to mint if not specified
   const condition = (merged.condition ?? "mint") as RequestCondition;
+
+  // At this point, category and productName are guaranteed non-null
+  // (the incomplete-identity block above returned early if either was null).
+  const category = merged.category!;
+  const productName = merged.productName!;
 
   // Parse expiration date
   let expDate: Date | null = null;
@@ -421,15 +551,67 @@ async function processSessionItem(
   }
 
   // Engine lookup
-  const rows = await deps.queryPrices(
-    merged.category,
-    merged.productName,
+  let rows = await deps.queryPrices(
+    category,
+    productName,
     merged.reference,
   );
 
+  // If no rows and no reference, check if the product needs one (Dexcom).
+  // This prevents infinite recursion: without this check, lookupPrice returns
+  // not_found → disambiguation finds the same product → calls us again → loop.
+  if (rows.length === 0 && merged.reference === null) {
+    const availableRefs = await deps.queryReferences(
+      category,
+      productName,
+    );
+    if (availableRefs.length === 1) {
+      // Single reference → auto-select and re-query
+      merged = { ...merged, reference: availableRefs[0]! };
+      rows = await deps.queryPrices(
+        category,
+        productName,
+        merged.reference,
+      );
+    } else if (availableRefs.length > 1) {
+      // Multiple references → ask the seller
+      session.partial = { ...merged, condition };
+      session.pendingReferences = availableRefs;
+      return {
+        text: formatReferencePrompt(productName, availableRefs),
+        routeToHuman: false,
+      };
+    }
+    // 0 references → product truly doesn't exist, fall through to lookupPrice → not_found
+  }
+
+  if (rows.length === 0) {
+    // No rows found. Try disambiguation (partial name match) unless we've
+    // already been through this path (skipDisambiguation prevents the infinite
+    // loop: Dexcom product → 0 rows → same product found → processSessionItem
+    // → 0 rows → ...).
+    if (!skipDisambiguation) {
+      const term = searchHint ?? productName;
+      if (term) {
+        const disambigResult = await attemptDisambiguation(
+          term, merged, session, deps, today,
+        );
+        if (disambigResult) return disambigResult;
+      }
+    }
+    // Truly not found — route to human
+    session.partial = { ...EMPTY_PARTIAL };
+    return {
+      text:
+        "I don't have that in our system, but let me connect you " +
+        "with a team member who can look into it for you.",
+      routeToHuman: true,
+    };
+  }
+
   const request: PriceLookupRequest = {
-    category: merged.category,
-    productName: merged.productName,
+    category: category,
+    productName: productName,
     reference: merged.reference,
     condition,
     expirationDate: expDate,
@@ -441,7 +623,7 @@ async function processSessionItem(
     case "found": {
       const qty = merged.quantity ?? null;
       const quoteItem: QuoteItem = {
-        productName: merged.productName,
+        productName: productName,
         reference: merged.reference,
         condition,
         quantity: qty,
@@ -453,7 +635,7 @@ async function processSessionItem(
       session.quotedItems.push(quoteItem);
       session.partial = { ...EMPTY_PARTIAL };
       return {
-        text: `✅ ${formatItemLine(quoteItem)}\n\nAnything else to add?`,
+        text: formatFoundResponse(quoteItem),
         routeToHuman: false,
       };
     }
@@ -462,13 +644,15 @@ async function processSessionItem(
       if (result.reason.includes("Expiration date")) {
         session.partial = { ...merged, condition };
         return {
-          text: "Got it! What's the expiration date on the box?",
+          text: "I found that product! When does it expire? Just the month and year is fine.",
           routeToHuman: false,
         };
       }
       session.partial = { ...EMPTY_PARTIAL };
       return {
-        text: `We're not currently buying that. ${result.reason}`,
+        text:
+          `Unfortunately we can't take that one right now — ${result.reason} ` +
+          `Would you like to try another item?`,
         routeToHuman: false,
       };
     }
@@ -476,7 +660,9 @@ async function processSessionItem(
     case "not_found": {
       session.partial = { ...EMPTY_PARTIAL };
       return {
-        text: "I don't have that item in our system. Let me connect you with a team member.",
+        text:
+          "I don't have that in our system, but let me connect you " +
+          "with a team member who can look into it for you.",
         routeToHuman: true,
       };
     }
@@ -484,46 +670,296 @@ async function processSessionItem(
     case "expired_too_old": {
       session.partial = { ...EMPTY_PARTIAL };
       return {
-        text: `Sorry, that item is too old for us to accept. ${result.reason}`,
+        text:
+          `Unfortunately that one's too old for us — ${result.reason} ` +
+          `Would you like to try another item?`,
         routeToHuman: false,
       };
     }
   }
 }
 
-// ---- helpers ----
+// ---- disambiguation ----
 
-function formatItemLine(item: QuoteItem): string {
-  const ref = item.reference ? ` (${item.reference})` : "";
-  const cond = item.condition.replace("_", " ");
-  const qty = item.quantity !== null ? `${item.quantity} × ` : "";
-  const total =
-    item.totalPrice !== null ? ` — total $${item.totalPrice}` : "";
-  return `${item.productName}${ref}, ${cond}: ${qty}$${item.unitPrice}/unit${total}`;
+const MAX_DISAMBIGUATION_OPTIONS = 8;
+
+/**
+ * Search for candidate products and either auto-select, present options,
+ * or return null (no matches / too many). Called from processSessionItem
+ * when the product identity is incomplete or doesn't match the DB.
+ */
+async function attemptDisambiguation(
+  searchTerm: string,
+  merged: PartialItem,
+  session: Session,
+  deps: SessionDeps,
+  today: Date,
+): Promise<{ text: string; routeToHuman: boolean } | null> {
+  const allCandidates = await deps.searchProducts(searchTerm);
+
+  // If we know the category, narrow to it
+  const candidates = merged.category
+    ? allCandidates.filter((c) => c.category === merged.category)
+    : allCandidates;
+
+  if (candidates.length === 0) {
+    // No matches in the DB — return null to let the caller handle it
+    // (either askForMissing or route to human depending on context).
+    return null;
+  }
+
+  if (candidates.length === 1) {
+    // Single match → auto-select and process immediately
+    const match = candidates[0]!;
+    const enriched: PartialItem = {
+      ...merged,
+      category: match.category,
+      productName: match.productName,
+    };
+    return processSessionItem(enriched, session, deps, today);
+  }
+
+  if (candidates.length <= MAX_DISAMBIGUATION_OPTIONS) {
+    // Multiple matches → store candidates and present options
+    session.disambiguation = {
+      candidates,
+      baseItem: {
+        ...merged,
+        category: merged.category ?? null,
+        productName: null,
+      },
+    };
+    session.partial = { ...EMPTY_PARTIAL };
+    return {
+      text: formatDisambiguation(searchTerm, candidates),
+      routeToHuman: false,
+    };
+  }
+
+  // Too many matches
+  session.partial = { ...merged };
+  return {
+    text:
+      `That matches quite a few products in our system. ` +
+      `Could you be a bit more specific? For example, include the pack size or count.`,
+    routeToHuman: false,
+  };
+}
+
+function formatDisambiguation(
+  description: string,
+  candidates: Array<{ category: string; productName: string }>,
+): string {
+  const lines = candidates.map(
+    (c, i) => `${i + 1}. ${c.productName}`,
+  );
+  return (
+    `I found a few options that could match "${description}" — which one do you have?\n\n` +
+    lines.join("\n") +
+    "\n\nJust reply with the number or the product name."
+  );
+}
+
+/**
+ * Try to resolve a disambiguation reply. Handles number selection ("1", "2")
+ * and partial name matching ("the 100", "100 count").
+ */
+export function resolveDisambiguation(
+  message: string,
+  state: DisambiguationState,
+): { category: string; productName: string } | null {
+  const trimmed = message.trim();
+
+  // Number selection: "1", "2", etc.
+  const num = parseInt(trimmed, 10);
+  if (!Number.isNaN(num) && num >= 1 && num <= state.candidates.length) {
+    return state.candidates[num - 1]!;
+  }
+
+  // Text match: case-insensitive, check both directions.
+  // Require at least 2 characters to avoid spurious single-char matches.
+  if (trimmed.length < 2) return null;
+  const lower = trimmed.toLowerCase();
+  const match = state.candidates.find(
+    (c) =>
+      c.productName.toLowerCase().includes(lower) ||
+      lower.includes(c.productName.toLowerCase()),
+  );
+  if (match) return match;
+
+  return null;
+}
+
+// ---- reference handling (Dexcom products) ----
+
+/**
+ * After disambiguation resolves a product, check if it needs a reference
+ * code before the engine can look up a price. If so, store pending refs
+ * and return a prompt. If not (or single ref → auto-select), return null.
+ */
+async function checkReferenceNeeded(
+  enriched: PartialItem,
+  session: Session,
+  deps: SessionDeps,
+): Promise<{ text: string; routeToHuman: boolean } | null> {
+  if (enriched.reference || !enriched.category || !enriched.productName) {
+    return null; // already has a reference, or incomplete identity
+  }
+
+  const refs = await deps.queryReferences(
+    enriched.category,
+    enriched.productName,
+  );
+
+  if (refs.length <= 1) {
+    // 0 refs = no reference needed (or product doesn't exist)
+    // 1 ref = auto-select (handled in processSessionItem)
+    return null;
+  }
+
+  // Multiple references — ask the seller
+  session.partial = { ...enriched };
+  session.pendingReferences = refs;
+  return {
+    text: formatReferencePrompt(enriched.productName, refs),
+    routeToHuman: false,
+  };
+}
+
+/**
+ * Try to match a message against a list of pending reference codes.
+ * Handles number selection ("1"), exact match ("012"), and bare text.
+ */
+export function resolveReference(
+  message: string,
+  availableRefs: string[],
+): string | null {
+  const trimmed = message.trim();
+
+  // Number selection
+  const num = parseInt(trimmed, 10);
+  if (
+    !Number.isNaN(num) &&
+    num >= 1 &&
+    num <= availableRefs.length &&
+    String(num) === trimmed
+  ) {
+    return availableRefs[num - 1]!;
+  }
+
+  // Exact match (case-insensitive)
+  const lower = trimmed.toLowerCase();
+  const exact = availableRefs.find(
+    (r) => r.toLowerCase() === lower,
+  );
+  if (exact) return exact;
+
+  // Substring match: "OR & OM" from "the OR & OM one"
+  const sub = availableRefs.find(
+    (r) => lower.includes(r.toLowerCase()),
+  );
+  if (sub) return sub;
+
+  return null;
+}
+
+function formatReferencePrompt(
+  productName: string,
+  refs: string[],
+): string {
+  const lines = refs.map((r, i) => `${i + 1}. ${r}`);
+  return (
+    `Which reference code? For ${productName}, the options are:\n\n` +
+    lines.join("\n") +
+    "\n\nJust reply with the number or the code."
+  );
+}
+
+// ---- response helpers ----
+
+function formatFoundResponse(item: QuoteItem): string {
+  const ref = item.reference ? ` (ref ${item.reference})` : "";
+  const condAdj = conditionAdjective(item.condition);
+  const product = `${item.productName}${ref}`;
+
+  if (item.quantity !== null && item.totalPrice !== null) {
+    return (
+      `Great — for your ${item.quantity} ${condAdj}${product}, ` +
+      `we can offer $${item.unitPrice} per unit, so $${item.totalPrice} total. ` +
+      `Do you have anything else you'd like to sell?`
+    );
+  }
+
+  return (
+    `For your ${condAdj}${product}, we can offer $${item.unitPrice} per unit. ` +
+    `Do you have anything else you'd like to sell?`
+  );
+}
+
+function conditionAdjective(condition: string): string {
+  switch (condition) {
+    case "mint":
+      return "";
+    case "ding":
+      return "dinged ";
+    case "damaged":
+      return "damaged ";
+    case "short_date":
+      return "short-dated ";
+    case "expired":
+      return "expired ";
+    default:
+      return `${condition} `;
+  }
 }
 
 function askForMissing(partial: PartialItem): string {
   const missing: string[] = [];
 
   if (!partial.category && !partial.productName) {
-    missing.push("which product you have (e.g. Accu-Chek Aviva 100, Freestyle Libre 3, Dexcom G7 sensor)");
+    missing.push(
+      "which product it is (like Accu-Chek Aviva 100, Freestyle Libre 3, or Dexcom G7 sensor)",
+    );
   } else if (!partial.productName) {
     missing.push("the specific product name");
   }
 
   if (!partial.expirationDate) {
-    missing.push("the expiration date");
+    missing.push("when it expires");
   }
 
   if (!partial.quantity) {
-    missing.push("how many boxes/packs");
+    missing.push("how many boxes you have");
   }
 
   if (missing.length === 0) {
-    return "Could you tell me more about the item?";
+    return "Could you tell me a bit more about the item?";
   }
 
-  return `Got it! I still need: ${missing.join("; ")}`;
+  if (missing.length === 1) {
+    return `Thanks! I just need one more thing — ${missing[0]}.`;
+  }
+
+  const last = missing.pop()!;
+  return `Thanks! I just need a few more details — ${missing.join(", ")}, and ${last}.`;
+}
+
+function queueReminder(count: number): string {
+  const items = count === 1 ? "1 item" : `${count} items`;
+  return (
+    `You now have ${items} in your quote — ` +
+    `send /quote or say "that's all" whenever you're ready for the PDF.`
+  );
+}
+
+/** Compact line format for the /quote summary list. */
+function formatQuoteLine(item: QuoteItem): string {
+  const ref = item.reference ? ` (${item.reference})` : "";
+  const condAdj = conditionAdjective(item.condition);
+  const qty = item.quantity !== null ? `${item.quantity} × ` : "";
+  const total =
+    item.totalPrice !== null ? ` — $${item.totalPrice} total` : "";
+  return `${condAdj}${item.productName}${ref}: ${qty}$${item.unitPrice}/unit${total}`;
 }
 
 // ---- regex fallback for follow-up messages ----
@@ -661,7 +1097,9 @@ const CLOSING_PATTERNS = [
   /\bnothing\s+(?:else|more)\b/i,
   /\bi'?m\s+done\b/i,
   /\bdone$/i,
-  /\ball\s+(?:done|set|good)\b/i,
+  /\ball\s+(?:done|set|good|ready)\b/i,
+  /\balready$/i,
+  /^no,?\s*(?:all\s*ready|already)$/i,
   // Spanish
   /\bsolo\s+eso\b/i,
   /\bes\s+todo\b/i,
