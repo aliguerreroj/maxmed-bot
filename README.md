@@ -30,7 +30,7 @@ tracing it to the exact DB row.
 
 TypeScript + Node 22, [grammy](https://grammy.dev) (Telegram),
 Claude API (Haiku for extraction and phrasing), PostgreSQL 17 + Prisma,
-PDFKit (quote PDF), ExcelJS (parser), Vitest (217 grounding + pipeline tests).
+PDFKit (quote PDF), ExcelJS (parser), Vitest (239 grounding + pipeline tests).
 No n8n, no vector search — pricing is exact lookup.
 
 ## Data model (two tables)
@@ -51,7 +51,9 @@ See `prisma/schema.prisma` for annotated definitions.
 ## Conversation flow
 
 The bot supports multi-turn conversations with incremental information
-gathering and multi-item accumulation.
+gathering, smart disambiguation, and multi-item accumulation. Per-item
+responses use warm, natural language — like a friendly buyer talking to a
+seller, not a system printing output.
 
 **Session memory.** Each Telegram chat has an in-memory session
 (`Map<chatId, Session>`) that stores partially-extracted fields and
@@ -62,37 +64,83 @@ flow:
 
 ```
 Seller: "I have some Aviva 100 test strips"
-Bot:    "Got it! I still need: the expiration date; how many boxes/packs"
+Bot:    "Thanks! I just need a few more details — when it expires,
+         and how many boxes you have."
 
 Seller: "exp May 2027, 10 boxes"
-Bot:    "✅ Accu-Chek Aviva plus 100, mint: 10 × $60/unit — total $600
-         Anything else to add?"
+Bot:    "Great — for your 10 Accu-Chek Aviva plus 100, we can offer
+         $60 per unit, so $600 total. Do you have anything else
+         you'd like to sell?"
 ```
 
 A deterministic regex fallback (English + Spanish) catches dates,
 quantities, and conditions when the LLM returns zero items for a follow-up
 message that has no product name.
 
-**Multi-item accumulation.** After each quoted item, the bot asks "Anything
-else to add?" and stores the item in the session. The seller can keep adding
-items across multiple messages.
+**Smart disambiguation.** When a seller names a product partially or
+ambiguously (e.g. "Accu-Chek Aviva plus" without the count, or "DEXCOM
+SENSOR 1 PACK" without the variant), the bot searches the DB for matching
+products by case-insensitive substring and presents a numbered list:
+
+```
+Seller: "I have Accu-Chek Aviva plus"
+Bot:    "I found a few options that could match — which one do you have?
+
+         1. Accu-Chek Aviva plus 100
+         2. Accu-Chek Aviva plus 50
+         3. Accu-Chek Aviva plus 50 MO
+
+         Just reply with the number or the product name."
+
+Seller: "1"
+Bot:    "Thanks! I just need a few more details — when it expires,
+         and how many boxes you have."
+```
+
+Single match → auto-selects (no list). Too many matches (>8) → asks the
+seller to be more specific. Zero matches → routes to a human.
+
+For Dexcom products that require a reference code (OE, OR, 012, 013, etc.),
+the bot adds a follow-up step after disambiguation:
+
+```
+Seller: "2"  (picked DEXCOM SENSOR 1 PACK (Non-15 Day))
+Bot:    "Which reference code? For DEXCOM SENSOR 1 PACK (Non-15 Day):
+
+         1. 011
+         2. 012
+         3. 013
+         4. 030
+
+         Just reply with the number or the code."
+
+Seller: "012"
+Bot:    "Great — for your DEXCOM SENSOR 1 PACK (Non-15 Day) (ref 012),
+         we can offer $75 per unit."
+```
+
+Disambiguation runs before the LLM extraction call (number replies skip the
+API entirely), and all paths are guarded against infinite recursion with a
+`skipDisambiguation` flag and reference-check interception.
+
+**Multi-item accumulation.** After each quoted item, the bot asks "Do you
+have anything else you'd like to sell?" and stores the item in the session.
+The seller can keep adding items across multiple messages.
 
 **`/quote` command.** Generates a combined PDF with all accumulated items,
 a grand total, and 7-day validity terms, then clears the session.
 
 **Auto-quote on closing phrases.** When the seller says "that's all",
-"no more", "solo eso", "nada más", or similar (detected by a deterministic
-regex before the LLM call — zero cost, instant), the bot automatically
-triggers the `/quote` flow.
+"no more", "all ready", "solo eso", "nada más", or similar (detected by a
+deterministic regex before the LLM call — zero cost, instant), the bot
+automatically triggers the `/quote` flow.
 
 **`/start` command.** Clean welcome message explaining what the bot does
 and what info to provide. Clears any existing session.
 
 **Unrecognized products.** If the seller names a product not in the catalog
-(e.g. "Omnipod Dash pods"), the extraction returns `rawProductDescription`
-with the seller's text. The session handler detects this and routes to a
-human immediately — it never asks "which product?" for something that isn't
-on the sheet.
+and no partial matches are found (e.g. "Omnipod Dash pods"), the bot routes
+to a human with the seller's original description preserved.
 
 **Auto-clear.** Sessions expire after 10 minutes of inactivity via
 `setTimeout` per session.
@@ -114,7 +162,8 @@ src/
     types.ts         Engine request/result types with provenance
   bot/           Telegram bot + LLM calls + session management
     index.ts         grammy entry point, /start, /quote, startup loading
-    session.ts       Session store, merge logic, follow-up regex, closing detection
+    session.ts       Session store, merge, disambiguation, reference flow,
+                     follow-up regex, closing detection, response templates
     handler.ts       Direct pipeline (extract → lookup → phrase → PDF)
     extraction.ts    Extraction LLM (tool_use, forced structured output)
     phrasing.ts      Phrasing LLM (states exact prices, no math)
@@ -124,14 +173,15 @@ src/
     db.ts            Prisma client singleton
     env.ts           Typed, lazy environment access
   import.ts        npm run import — transactional DB rebuild
-tests/               217 tests across 8 files
+tests/               239 tests across 8 files
   dates.test.ts      Header parsing (15 tests)
   testStrips.test.ts Parser vs real sheet (26 tests)
   libre.test.ts      Parser vs real sheet (25 tests)
   dexcom.test.ts     Parser vs real sheet (30 tests)
   engine.test.ts     Grounding evals (42 tests)
   handler.test.ts    Pipeline wiring with mocked LLMs (15 tests)
-  session.test.ts    Session merge, accumulation, auto-quote, regex fallback (63 tests)
+  session.test.ts    Session merge, disambiguation, reference flow,
+                     multi-item accumulation, auto-quote, regex fallback (85 tests)
   scaffold.test.ts   Harness smoke test (1 test)
 ```
 
@@ -153,7 +203,7 @@ npm run db:migrate    # name the first migration "init"
 npm run import        # reads data/price-sheet.xlsx, loads 136 prices + 5 rules
 
 # 5. Run the test suite
-npm test              # 217 tests across 8 files, all should pass
+npm test              # 239 tests across 8 files, all should pass
 
 # 6. Start the bot
 npm run dev           # watches for changes
@@ -196,12 +246,6 @@ engine either finds a matching row or returns "not purchased."
 
 ## What I'd do with another week
 
-- **Smart disambiguation.** When the extraction maps to multiple possible
-  products (e.g. "DEXCOM SENSOR 1 PACK" could be G6 or G7, BOX or NO BOX),
-  the bot should present the options and let the seller pick rather than
-  routing to a human. This requires a disambiguation step between extraction
-  and engine lookup that queries the DB for matching candidates.
-
 - **Product table.** An item where every tier is N/A (e.g. Accu-Chek Guide
   50 MO) produces zero `BasePrice` rows and is indistinguishable from an item
   not on the sheet at all. A `Product` table recording every listed item —
@@ -227,3 +271,7 @@ engine either finds a matching row or returns "not purchased."
   rates, and route-to-human frequency over time. Flag conversations where the
   LLM extraction diverged from what the engine found, so the team can tune
   the extraction prompt or catalog coverage.
+
+- **Multilingual phrasing.** Detect the seller's language from their first
+  message and respond in kind. The extraction already handles Spanish input;
+  the response templates and phrasing LLM should match.
